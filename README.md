@@ -16,6 +16,7 @@ not have to pull in `beevulyk-proto` or run gRPC codegen at build time.
 One module per bounded context:
 
 - `identity::users` — user lifecycle events (`UserRegistered`, ...).
+- `marketplace::listings` — listing lifecycle events (`ListingPublished`, ...).
 
 ## Adding a new event
 

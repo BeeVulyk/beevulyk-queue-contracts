@@ -4,3 +4,4 @@
 //! struct. All events are JSON-serialized on the wire.
 
 pub mod identity;
+pub mod marketplace;
