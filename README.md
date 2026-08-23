@@ -18,6 +18,7 @@ One module per bounded context:
 - `identity::profiles` — profile lifecycle events (`ProfileVerificationChanged`, ...).
 - `identity::users` — user lifecycle events (`UserRegistered`, ...).
 - `marketplace::listings` — listing lifecycle events (`ListingPublished`, ...).
+- `marketplace::orders` — order lifecycle events (`OrderCreated`, ...).
 
 ## Adding a new event
 
