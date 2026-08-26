@@ -11,18 +11,29 @@
 //! has an explicit expiry: **a transactional outbox in `orders-service` becomes
 //! mandatory before `notification-service` ships.** A dropped
 //! `marketplace.orders.status_changed` would then mean a buyer is never told their
-//! queens shipped — an omission nobody can see and nothing repairs. `listings-service`
-//! does not need one: its `quantity_available` counter is an advertisement, not a
-//! ledger.
+//! queens shipped — an omission nobody can see and nothing repairs.
+//!
+//! `listings-service` still does not REQUIRE an outbox in this release, but the reason
+//! is narrower than it once was, and the honest statement of it is this: its
+//! `quantity_available` is no longer a counter anybody writes — it is derived from
+//! `quantity_total` minus `quantity_reserved` — and each of the three stock facts
+//! (reserved, consumed, released) is announced exactly once. So a dropped
+//! `status_changed` no longer self-corrects: a lost dispatch or a lost release leaves a
+//! reservation standing that no later event repairs, and the seller's own listing then
+//! offers fewer units than they hold until someone fixes it by hand. That is a wrong
+//! number rather than an unnoticeable one, and it is judged affordable for now — not
+//! evidence that the counter does not matter.
 //!
 //! # Idempotency is NOT uniform across this crate
 //!
 //! Every event written before `OrderConfirmed` carries ABSOLUTE state, which makes its
 //! consumers idempotent by construction — replaying any prefix of the stream converges.
 //! `OrderConfirmed` and `OrderStatusChanged` drive a DELTA on the `listings-service`
-//! stock counter, and a delta is not idempotent under at-least-once delivery. See
-//! `OrderConfirmed` for the ledger a consumer is required to keep; do NOT carry the
-//! commit-on-success pattern of `ProfileVerificationChanged` over to these two.
+//! stock counters, and a delta is not idempotent under at-least-once delivery. See
+//! `OrderStatusChanged` for the ledger a consumer is required to keep, and
+//! `OrderConfirmed` for why the two topics claim the same row on the one edge they
+//! share; do NOT carry the commit-on-success pattern of `ProfileVerificationChanged`
+//! over to these two.
 
 use serde::{Deserialize, Serialize};
 
@@ -235,7 +246,7 @@ pub struct OrderCreated {
 }
 
 /// One order line reduced to what a stock counter needs. Deliberately not
-/// `OrderCreatedItem`: a consumer adjusting `quantity_available` needs the listing and
+/// `OrderCreatedItem`: a consumer adjusting its stock counters needs the listing and
 /// the count and nothing else, and shipping the price snapshot to it would invite a
 /// consumer to start reasoning about money.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -277,7 +288,8 @@ pub const TOPIC_ORDER_CONFIRMED_DLQ: &str = "marketplace.orders.confirmed.dlq";
 ///
 /// Producer: `orders-service`.
 /// Consumers: `listings-service` (group `listings-service-order-confirmed`), which
-/// DECREMENTS the soft `quantity_available` counter of every listing in `items`.
+/// RESERVES the units of every listing in `items` — they stop being orderable, while
+/// still belonging to the seller until dispatch.
 ///
 /// This event is separate from `OrderStatusChanged` — which also reports the move to
 /// `Confirmed` — because it is the one transition with a FUNCTIONAL consumer rather
@@ -287,6 +299,26 @@ pub const TOPIC_ORDER_CONFIRMED_DLQ: &str = "marketplace.orders.confirmed.dlq";
 /// filtering a firehose, and stops a newly added state from silently changing what it
 /// acts on.
 ///
+/// # Redundant with `OrderStatusChanged`, and deliberately RETAINED
+///
+/// That separation no longer buys what it was meant to. `status_changed` describes the
+/// same `PendingConfirmation -> Confirmed` edge, carries the same `OrderStockLine`s, and
+/// `listings-service` now consumes it for all three stock moves anyway — so on
+/// inspection this topic is redundant.
+///
+/// **It stays.** This is released contract with a live consumer; removing it buys
+/// nothing and costs a coordinated change across a producer and a consumer, and this
+/// feature is not where that risk gets spent. Treat the redundancy as an observation
+/// recorded here, not as a deprecation: nothing is scheduled to remove this topic, and a
+/// producer must keep publishing it.
+///
+/// The two are harmless together because they claim the SAME ledger row. Both this event
+/// and the `Confirmed` edge of `status_changed` establish exactly one fact —
+/// `(order_id, "reserved")` — so whichever arrives first applies the reservation and the
+/// other finds the row present and does nothing. That is deliberate redundancy under
+/// best-effort publishing with no outbox: two announcements of one fact, and losing
+/// either one still leaves the reservation made.
+///
 /// Publication semantics: see the module doc — best-effort publish after commit, no
 /// outbox yet.
 ///
@@ -295,11 +327,11 @@ pub const TOPIC_ORDER_CONFIRMED_DLQ: &str = "marketplace.orders.confirmed.dlq";
 ///
 /// # Idempotency — read this before writing a consumer
 ///
-/// Delivery is at-least-once and the consumer applies a DELTA
-/// (`quantity_available - n`), not an absolute value. **A delta is not idempotent.** A
-/// redelivered message — a rebalance, a retry, a restart between the write and the
-/// offset commit — decrements a second time. The counter is then permanently wrong, no
-/// later event corrects it, and nothing surfaces the error: the listing simply
+/// Delivery is at-least-once and the consumer applies a DELTA (`reserved + n`, which
+/// takes the same `n` off what is orderable), not an absolute value. **A delta is not
+/// idempotent.** A redelivered message — a rebalance, a retry, a restart between the
+/// write and the offset commit — reserves a second time. The counter is then permanently
+/// wrong, no later event corrects it, and nothing surfaces the error: the listing simply
 /// advertises fewer queens than the seller has.
 ///
 /// The commit-on-success pattern used by `ProfileVerificationChanged` is **NOT
@@ -307,21 +339,25 @@ pub const TOPIC_ORDER_CONFIRMED_DLQ: &str = "marketplace.orders.confirmed.dlq";
 /// replaying it converges; this one does not, and copying it across is the specific
 /// mistake this paragraph exists to prevent.
 ///
-/// A consumer MUST keep a processed-event ledger keyed by `order_id`, insert into it IN
-/// THE SAME DATABASE TRANSACTION as the decrement, and skip the adjustment when the key
-/// is already present. The payload carries `order_id` and every `listing_id` with its
-/// `quantity` precisely so a consumer can do that without calling back into
-/// `orders-service`.
+/// A consumer MUST keep a processed-event ledger keyed by `(order_id, kind)` — the same
+/// ledger `OrderStatusChanged` describes in full, where the `kind` this event establishes
+/// is `reserved` — insert into it IN THE SAME DATABASE TRANSACTION as the reservation,
+/// and skip the adjustment when the key is already present. `order_id` alone is NOT the
+/// key: the same order later establishes a consume or a release, and a bare `order_id`
+/// ledger would make those look like duplicates of this reservation and silently drop
+/// them. The payload carries `order_id` and every `listing_id` with its `quantity`
+/// precisely so a consumer can do that without calling back into `orders-service`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrderConfirmed {
-    /// ULID (26-char Crockford base32). Also the Kafka message key, and the
-    /// deduplication key the consumer's processed-event ledger MUST be built on.
+    /// ULID (26-char Crockford base32). Also the Kafka message key, and the `order_id`
+    /// half of the composite `(order_id, kind)` key the consumer's processed-event
+    /// ledger MUST be built on.
     pub order_id: String,
     /// ULID of the buyer. Soft reference to `users_service.users`.
     pub buyer_id: String,
     /// ULID of the seller. Soft reference to `users_service.users`.
     pub seller_id: String,
-    /// Every line of the order, so all decrements can be applied in one transaction.
+    /// Every line of the order, so all reservations can be applied in one transaction.
     pub items: Vec<OrderStockLine>,
     /// Milliseconds since Unix epoch at which the confirmation committed.
     pub confirmed_at_ms: i64,
@@ -340,9 +376,10 @@ pub const TOPIC_ORDER_STATUS_CHANGED_DLQ: &str = "marketplace.orders.status_chan
 ///
 /// Producer: `orders-service`.
 /// Consumers: `listings-service` (group `listings-service-order-status-changed`), which
-/// RESTORES the soft `quantity_available` counter when an order that had taken stock is
-/// abandoned. `notification-service` (TASK-54) will be the second, and is the reason
-/// the outbox deadline in the module doc exists.
+/// drives ALL THREE of its stock moves off this one topic — it reserves units when an
+/// order is confirmed, consumes them when the order is dispatched, and releases them
+/// when an order is abandoned before dispatch. `notification-service` (TASK-54) will be
+/// the second, and is the reason the outbox deadline in the module doc exists.
 ///
 /// ONE topic, not one per state. The meaningful fact is the TRANSITION; the state it
 /// landed in is a field. A topic per state would multiply the topic count by twelve,
@@ -356,28 +393,77 @@ pub const TOPIC_ORDER_STATUS_CHANGED_DLQ: &str = "marketplace.orders.status_chan
 ///
 /// # Why `items` rides on a status event
 ///
-/// `listings-service` must give back the stock it took when a confirmed order is later
-/// abandoned, and it holds no copy of the order — it can only do that if the event
-/// carries the lines. They use the same `OrderStockLine` shape as `OrderConfirmed`, so
-/// the increment is the exact mirror of the decrement.
+/// `listings-service` must move stock on transitions it learns about only from this
+/// topic, and it holds no copy of the order — it can only do that if the event carries
+/// the lines. They use the same `OrderStockLine` shape as `OrderConfirmed`, so every
+/// move is applied from the same shape, and a release is the exact mirror of the
+/// reservation it undoes.
 ///
-/// # `from_status` decides whether stock is restored
+/// # The transition EDGE decides which stock move is owed, if any
 ///
-/// Stock is taken at `Confirmed` and nowhere else, so only a transition OUT of a state
-/// that had already taken it may give it back. A transition out of `PendingConfirmation`
-/// — the seller rejected the request, or it expired unanswered — never decremented
-/// anything, and restoring on it would inflate `quantity_available` above what the
-/// seller actually has. Transitions out of `Confirmed`, `Ready`, `Shipped`,
-/// `Observation` and `ReplacementRequested` DID decrement and must restore.
+/// A consumer classifies the `(from_status, to_status)` PAIR — not `to_status` alone,
+/// and not `from_status` alone — into exactly one of four outcomes:
+///
+/// * **reserve** — entering `Confirmed`. The units are promised to a named buyer and
+///   stop being orderable, while still belonging to the seller.
+/// * **consume** — DISPATCH: the units physically leave the apiary. That is entering
+///   `Shipped` (from `Confirmed` or from `Ready`), and — on the self-pickup path, which
+///   has no dispatch event at all — the buyer-confirmed collection edges
+///   `Ready -> Observation` (live class) and `Ready -> Completed` (goods class).
+/// * **release** — a terminal state reached BEFORE dispatch: `Rejected`, `Cancelled`
+///   or `Expired`. The reservation is given back.
+/// * **nothing** — every other edge, and in particular EVERYTHING after dispatch:
+///   `Completed` reached from `Observation` or `Shipped`, `ClosedReplaced`, and
+///   `ClosedUnresolved` — including the non-delivery edge out of `Shipped`.
+///
+/// Consumption is anchored at dispatch, not at delivery, because that is when the unit
+/// really leaves. A dispatched order has therefore ALREADY consumed its units and must
+/// never restore them; a parcel that never arrives needs no special rule, because the
+/// queens are gone either way and the buyer's remedy is a lifecycle matter.
+///
+/// **`to_status == Completed` is NOT uniformly a no-op.** Reached from `Ready` it is a
+/// self-pickup collection and therefore a DISPATCH — it consumes. Reached from
+/// `Observation` or `Shipped` it is post-dispatch and moves nothing. A consumer that
+/// branches on `to_status` alone gets that edge wrong in one direction or the other,
+/// which is exactly why the pair is the unit of classification. The self-pickup dispatch
+/// edges are uniquely identifiable from the pair alone, which is why this event carries
+/// no `delivery_method` and must not gain one.
+///
+/// Whether a release is actually OWED is then decided by the consumer's own ledger, not
+/// by `from_status`: the question is "was this order reserved, and has it not already
+/// been consumed?", and both halves are facts the consumer already holds. The event
+/// cannot answer it — `Cancelled` and `Expired` are each reachable both before a
+/// reservation exists (out of `PendingConfirmation`, where nothing was ever taken) and
+/// after one does (out of `Confirmed` or `Ready`).
 ///
 /// # Idempotency
 ///
-/// The same delta hazard as `OrderConfirmed`, in the opposite direction: the restore is
-/// an INCREMENT, and a redelivered message inflates the counter permanently and
-/// silently. A consumer MUST dedupe in a processed-event ledger written in the same
-/// transaction as the adjustment — keyed by `order_id` AND `to_status`, because one
-/// order legitimately produces many events on this topic and `order_id` alone would
-/// swallow every event after the first.
+/// The same delta hazard as `OrderConfirmed`, in both directions: a reserve and a consume
+/// each take units off what is orderable, a release gives them back, and a redelivered
+/// message — a rebalance, a retry, a restart between the write and the offset commit —
+/// moves the counter a second time, permanently and silently.
+///
+/// A consumer MUST dedupe in a processed-event ledger written in the SAME database
+/// transaction as the counter change, keyed by `order_id` AND the **stock fact** the
+/// event establishes — one of `reserved`, `consumed`, `released`.
+///
+/// Key on the fact, not on `to_status`. `to_status` is WIDER than the fact it records:
+/// a cancellation and an expiry are two `to_status` values but one fact — "this order's
+/// stock was given back" — so a `to_status` key would let each of them restore, and the
+/// listing would then advertise more queens than the seller has. `order_id` alone is too
+/// NARROW in the other direction: one order legitimately establishes several facts on
+/// this topic, and a bare `order_id` ledger would make the consume or release look like
+/// a duplicate of the reservation and swallow it.
+///
+/// Two rules complete it:
+///
+/// 1. **At most one of consume-or-release may ever apply to a given order.** They are
+///    mutually exclusive outcomes of one reservation, and the handler must enforce that
+///    itself rather than relying on the ledger to notice.
+/// 2. **A replacement child is an ordinary order for counting purposes.** It reserves
+///    and it consumes exactly like any other order, and it carries its own `order_id`,
+///    so it keeps its own ledger rows and needs no special case anywhere. That its goods
+///    cost the buyer nothing is a fact about money, not about bees.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrderStatusChanged {
     /// ULID (26-char Crockford base32). Also the Kafka message key.
@@ -387,7 +473,8 @@ pub struct OrderStatusChanged {
     /// ULID of the seller. Soft reference to `users_service.users`.
     pub seller_id: String,
     /// The state the order left. `None` ONLY on creation, where there is no prior
-    /// state. This is what tells a consumer whether stock had ever been decremented.
+    /// state. Read it TOGETHER with `to_status`: it is the pair that names the edge, and
+    /// the edge — not either field alone — that says which stock move is owed.
     pub from_status: Option<OrderStatus>,
     /// The state the order entered.
     pub to_status: OrderStatus,

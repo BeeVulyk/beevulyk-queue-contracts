@@ -77,7 +77,7 @@ fn a_producer_can_build_and_serialise_every_new_event() {
 }
 
 /// The consumer side: deserialise a raw wire payload of the shape `listings-service`
-/// will actually receive, and read the fields it needs to adjust its counter.
+/// will actually receive, and read the fields it needs to move its stock counters.
 #[test]
 fn the_listings_consumer_can_deserialise_and_read_a_confirmed_payload() {
     let wire = r#"{
@@ -90,19 +90,30 @@ fn the_listings_consumer_can_deserialise_and_read_a_confirmed_payload() {
 
     let ev: OrderConfirmed = serde_json::from_str(wire).unwrap();
 
-    // The dedup key the processed-event ledger must be built on.
+    // The `order_id` half of the composite `(order_id, kind)` ledger key; the `kind`
+    // this event establishes is `reserved`.
     assert_eq!(ev.order_id, "01JABCORDER00000000000000");
-    // The delta the consumer applies: quantity_available - 3.
+    // The delta the consumer applies: reserved + 3, which takes the same 3 off what
+    // the listing offers.
     assert_eq!(ev.items.len(), 1);
     assert_eq!(ev.items[0].listing_id, "01JABCLISTING0000000000000");
     assert_eq!(ev.items[0].quantity, 3);
 }
 
-/// `from_status` is what tells the consumer whether stock had ever been taken, so it
-/// must survive the wire as an explicit `null` on creation and as a value otherwise.
+/// A stock consumer classifies the `(from_status, to_status)` PAIR — reserve, consume,
+/// release or nothing — so BOTH halves of the pair have to survive the wire, on every
+/// class of edge and not only on the one that moves a counter downwards.
+///
+/// The three payloads below are one of each class a consumer must tell apart, written
+/// as the raw JSON `listings-service` actually receives. **The assertions are
+/// deserialisation checks and nothing more**: the classification itself belongs to the
+/// consumer, which does not live in this repo, so what is pinned here is that the fields
+/// it classifies on arrive intact and with the wire slugs the contract promises.
 #[test]
-fn the_listings_consumer_can_tell_a_restoring_transition_from_a_non_restoring_one() {
-    let never_decremented = r#"{
+fn every_class_of_stock_edge_survives_the_wire() {
+    // NOTHING — before any reservation exists. Nothing was ever taken for this order,
+    // so there is nothing to give back.
+    let before_any_reservation = r#"{
         "order_id": "01JABCORDER00000000000000",
         "buyer_id": "01JABCBUYER00000000000000",
         "seller_id": "01JABCSELLER00000000000000",
@@ -114,28 +125,58 @@ fn the_listings_consumer_can_tell_a_restoring_transition_from_a_non_restoring_on
         "items": [{"listing_id": "01JABCLISTING0000000000000", "quantity": 3}],
         "at_ms": 1780000300000
     }"#;
-    let ev: OrderStatusChanged = serde_json::from_str(never_decremented).unwrap();
+    let ev: OrderStatusChanged = serde_json::from_str(before_any_reservation).unwrap();
     assert_eq!(ev.from_status, Some(OrderStatus::PendingConfirmation));
     assert_eq!(ev.to_status, OrderStatus::Rejected);
 
-    let did_decrement = r#"{
+    // RELEASE — a terminal state reached before dispatch. The T5 sweep closes a
+    // self-pickup order nobody ever collected, and the reservation is given back.
+    let release_before_dispatch = r#"{
+        "order_id": "01JABCORDER00000000000000",
+        "buyer_id": "01JABCBUYER00000000000000",
+        "seller_id": "01JABCSELLER00000000000000",
+        "from_status": "ready",
+        "to_status": "expired",
+        "actor_type": "system",
+        "actor_id": null,
+        "reason": null,
+        "items": [{"listing_id": "01JABCLISTING0000000000000", "quantity": 3}],
+        "at_ms": 1780000400000
+    }"#;
+    let ev: OrderStatusChanged = serde_json::from_str(release_before_dispatch).unwrap();
+    assert_eq!(ev.from_status, Some(OrderStatus::Ready));
+    assert_eq!(ev.to_status, OrderStatus::Expired);
+    assert_eq!(ev.actor_type, ActorType::System);
+    // A system sweep names no account, and an expiry needs no reason: both `None`
+    // arrive as an explicit `null` on the wire.
+    assert_eq!(ev.actor_id, None);
+    assert_eq!(ev.reason, None);
+    // The lines ride along on a release exactly as they do on a reservation, so the
+    // consumer can mirror the move without holding a copy of the order.
+    assert_eq!(ev.items.len(), 1);
+    assert_eq!(ev.items[0].quantity, 3);
+
+    // NOTHING — after dispatch. Non-delivery: the parcel never arrived, but the queens
+    // left the apiary when it was handed to the carrier, so they were consumed then and
+    // this edge moves nothing. `from_status` is the only thing separating it from an
+    // edge that releases, which is why the pair is what a consumer must read.
+    let after_dispatch = r#"{
         "order_id": "01JABCORDER00000000000000",
         "buyer_id": "01JABCBUYER00000000000000",
         "seller_id": "01JABCSELLER00000000000000",
         "from_status": "shipped",
         "to_status": "closed_unresolved",
-        "actor_type": "system",
-        "actor_id": null,
-        "reason": "seller_silent",
+        "actor_type": "buyer",
+        "actor_id": "01JABCBUYER00000000000000",
+        "reason": "not_delivered",
         "items": [{"listing_id": "01JABCLISTING0000000000000", "quantity": 3}],
         "at_ms": 1780000500000
     }"#;
-    let ev: OrderStatusChanged = serde_json::from_str(did_decrement).unwrap();
+    let ev: OrderStatusChanged = serde_json::from_str(after_dispatch).unwrap();
     assert_eq!(ev.from_status, Some(OrderStatus::Shipped));
-    assert_eq!(ev.actor_type, ActorType::System);
-    // A system sweep names no account.
-    assert_eq!(ev.actor_id, None);
-    assert_eq!(ev.reason.as_deref(), Some("seller_silent"));
+    assert_eq!(ev.to_status, OrderStatus::ClosedUnresolved);
+    assert_eq!(ev.actor_type, ActorType::Buyer);
+    assert_eq!(ev.reason.as_deref(), Some("not_delivered"));
 }
 
 /// Every new DLQ constant is its topic plus `.dlq`, asserted from outside the crate so
