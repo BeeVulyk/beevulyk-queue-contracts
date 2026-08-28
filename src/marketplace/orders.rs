@@ -88,16 +88,62 @@ pub enum FulfilmentClass {
 /// How the goods reach the buyer. Variants MUST stay in lockstep with the proto enum
 /// `marketplace.reference.v1.DeliveryMethod`, minus `UNSPECIFIED`.
 ///
-/// `NovaPoshta` IS DELIBERATELY ABSENT AND MUST NOT BE ADDED. Nova Poshta prohibits
-/// sending insects outright; offering it would route the wedge category (queens) into
-/// a carrier that forbids the shipment, voiding any recourse against them and
-/// producing disputes the platform has decided not to arbitrate (TASK-67).
+/// # `NovaPoshta` was admitted in 0.8.0, for INERT GOODS ONLY (TASK-50/51/52)
+///
+/// Until 0.8.0 this doc carried a standing instruction that `NovaPoshta` must never be
+/// added, because the carrier prohibits sending insects outright. **That prohibition was
+/// not lifted; only its SCOPE changed.** It had been applied to all nine product
+/// categories, and six of them — honey, bee products, hives, equipment, veterinary
+/// preparations and agri goods — are inert things the prohibition says nothing about, and
+/// for which Nova Poshta is the dominant carrier in Ukraine. Queens, bee packages and
+/// colonies are unchanged: Nova Poshta must never be offered for them, because routing the
+/// wedge category into a carrier that forbids the shipment voids any recourse against them
+/// and produces disputes the platform has decided not to arbitrate (TASK-66/67).
+///
+/// **This enum cannot enforce that split and does not try to.** Admitting a member to the
+/// dictionary is not the same as making it legal for a category. The normative per-category
+/// table is `listings-service/src/domain/delivery.rs::allowed_delivery_methods`, which
+/// matches on the CATEGORY; a member present here is legal for exactly zero categories
+/// until that function says otherwise, and no compiler error catches the omission.
+///
+/// # ADDING A VARIANT HERE IS WIRE-BREAKING, NOT ADDITIVE
+///
+/// **Do not reason by analogy from `beevulyk-proto`.** The identical addition there —
+/// `DELIVERY_METHOD_NOVA_POSHTA = 4`, released in proto 0.18.0 — genuinely IS additive, and
+/// `proto/marketplace/reference/v1/reference.proto` says so explicitly: proto3 enums are
+/// OPEN, so a service pinned to an older proto tag keeps deserialising and merely sees a
+/// number it does not recognise.
+///
+/// **serde matches enum variants CLOSED.** A consumer still pinned to the previous tag of
+/// THIS crate that receives `"delivery_method":"nova_poshta"` does not degrade gracefully —
+/// it fails to deserialise the ENTIRE payload, the message lands in the DLQ, and the order
+/// it described is silently never processed. `OrderCreated.delivery_method` is typed as this
+/// enum, so the blast radius is every consumer of `marketplace.orders.created`.
+///
+/// **Therefore every consumer of an event carrying this type MUST be bumped to the new tag
+/// in the SAME release as the producer that can emit the new variant.** For 0.8.0 that is:
+///
+/// * `orders-service` — the PRODUCER of `OrderCreated`; it cannot emit the variant until it
+///   is bumped, which is also what makes the ordering safe.
+/// * `notification-service` — the only CONSUMER of `OrderCreated`
+///   (`adapters/kafka/order_created_consumer.rs`, `application/handle_order_created.rs`).
+///   This is the service that DLQs if it is left behind.
+///
+/// `listings-service` consumes `OrderConfirmed` and `OrderStatusChanged`, and neither of
+/// those carries a `DeliveryMethod`, so it is unaffected by THIS change. That is a fact about
+/// today's event shapes, not a permanent property: re-derive the list from which events
+/// actually carry this type before the next variant, rather than trusting this paragraph.
+///
+/// The breakage above is PROVED, not merely asserted — see
+/// `a_consumer_on_the_previous_tag_dlqs_the_new_variant` in this module's tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryMethod {
     Ukrposhta,
     SelfPickup,
     CourierAgreed,
+    /// Added in 0.8.0. Inert goods only — see the enum doc. Wire slug `nova_poshta`.
+    NovaPoshta,
 }
 
 /// Unit in which the ordered quantity is counted. Variants MUST stay in lockstep with
@@ -499,6 +545,93 @@ pub struct OrderStatusChanged {
     pub at_ms: i64,
 }
 
+/// Kafka topic on which `OrderDispatched` events are published.
+///
+/// Convention: `<domain>.<context>.<event-name>`.
+pub const TOPIC_ORDER_DISPATCHED: &str = "marketplace.orders.dispatched";
+
+/// Dead-letter topic for `marketplace.orders.dispatched`.
+pub const TOPIC_ORDER_DISPATCHED_DLQ: &str = "marketplace.orders.dispatched.dlq";
+
+/// Emitted by `orders-service` when an order is handed to a carrier — that is, on every
+/// committed transition INTO [`OrderStatus::Shipped`].
+///
+/// Producer: `orders-service`, written to its transactional outbox in the SAME database
+/// transaction as the transition itself. Unlike the best-effort events described in the
+/// module doc, the dispatch fact therefore cannot be lost: a parcel that was shipped but
+/// whose event was dropped would never be tracked at all, and nothing later would repair
+/// it, because there is no second announcement of a dispatch.
+///
+/// Consumers: `shipping-service` (group `shipping-service-order-dispatched`), which opens
+/// a shipment row and begins polling the carrier.
+///
+/// Publication semantics: at-least-once, via the outbox relay, AFTER the transition
+/// commits.
+///
+/// Message key: `order_id`, so a dispatch stays on the same partition as the order's other
+/// events and per-order ordering holds.
+///
+/// Idempotency: consumers key on `order_id`. A redelivery — a rebalance, a relay retry, a
+/// restart between the write and the offset commit — MUST NOT create a second shipment for
+/// the same order. The payload carries absolute state, never a delta.
+///
+/// # Why this exists ALONGSIDE `OrderStatusChanged`, which reports the same edge
+///
+/// A future reader will be tempted to merge the two. They cannot be merged, and the reason
+/// is written into the other event's own contract.
+///
+/// `shipping-service` must learn WHICH parcels to poll without reading `orders_service`
+/// tables and without a gRPC client. `OrderStatusChanged` cannot tell it: it carries no
+/// tracking number, and its doc rules out the other half of what a poller needs in as many
+/// words — "this event carries no `delivery_method` and must not gain one", because the
+/// self-pickup dispatch edges are identifiable from the `(from_status, to_status)` pair
+/// alone and adding the field would invite a consumer to branch on it instead.
+///
+/// So the dispatch fact gets its own topic rather than a field on a topic that has
+/// explicitly ruled that field out. Widening `OrderStatusChanged` is the wrong fix; the
+/// prohibition there is deliberate.
+///
+/// The reverse direction needs no new event. `OrderStatusChanged` already says when an
+/// order concluded, which is the signal that STOPS a poll.
+///
+/// # Self-pickup NEVER produces this event
+///
+/// Not "produces one with a null tracking number" — produces nothing at all. A self-pickup
+/// order has no dispatch event in the first place: the buyer collects, and the edges that
+/// record the collection are `Ready -> Observation` and `Ready -> Completed` on
+/// `status_changed`. There is no carrier, so there is nothing to poll.
+///
+/// # Why `tracking_number` is `Option`, and what the two cases mean
+///
+/// A seller may legitimately dispatch WITHOUT supplying a TTN. That is a real dispatch and
+/// the event is still published — the order shipped, and suppressing the event would lose
+/// that fact — but there is nothing to track.
+///
+/// **`None` here is NOT the same as "we polled the carrier and learned nothing new", and a
+/// consumer MUST record the difference rather than collapsing both into "no information".**
+/// The first is never-asked; the second is asked-and-unchanged. Collapsing them makes a
+/// carrier outage and a seller's missing TTN indistinguishable in the record, which is
+/// exactly the diagnosis someone will need at the moment it matters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrderDispatched {
+    /// ULID (26-char Crockford base32). Also the Kafka message key.
+    pub order_id: String,
+    /// ULID of the buyer. Soft reference to `users_service.users`.
+    pub buyer_id: String,
+    /// ULID of the seller. Soft reference to `users_service.users`.
+    pub seller_id: String,
+    /// How the goods reach the buyer, snapshotted from the order. Never
+    /// [`DeliveryMethod::SelfPickup`] — that path produces no dispatch event at all.
+    pub delivery_method: DeliveryMethod,
+    /// The seller's TTN (carrier tracking number), or `None` when they dispatched without
+    /// supplying one. See the struct doc: `None` means never-asked, and must not be
+    /// conflated with a poll that returned nothing new.
+    pub tracking_number: Option<String>,
+    /// Milliseconds since Unix epoch at which the dispatch committed — the order's
+    /// `shipped_at`.
+    pub dispatched_at_ms: i64,
+}
+
 /// Kafka topic on which `OrderReplacementRequested` events are published.
 ///
 /// Convention: `<domain>.<context>.<event-name>`.
@@ -604,10 +737,19 @@ mod tests {
             TOPIC_ORDER_REPLACEMENT_REQUESTED_DLQ,
             format!("{TOPIC_ORDER_REPLACEMENT_REQUESTED}.dlq")
         );
+        assert_eq!(
+            TOPIC_ORDER_DISPATCHED_DLQ,
+            format!("{TOPIC_ORDER_DISPATCHED}.dlq")
+        );
     }
 
     #[test]
     fn topic_names_are_pinned() {
+        assert_eq!(TOPIC_ORDER_DISPATCHED, "marketplace.orders.dispatched");
+        assert_eq!(
+            TOPIC_ORDER_DISPATCHED_DLQ,
+            "marketplace.orders.dispatched.dlq"
+        );
         assert_eq!(TOPIC_ORDER_CONFIRMED, "marketplace.orders.confirmed");
         assert_eq!(
             TOPIC_ORDER_STATUS_CHANGED,
@@ -777,5 +919,132 @@ mod tests {
             serde_json::to_string(&QuantityUnit::Kilogram).unwrap(),
             "\"kilogram\""
         );
+        assert_eq!(
+            serde_json::to_string(&DeliveryMethod::Ukrposhta).unwrap(),
+            "\"ukrposhta\""
+        );
+        // Added in 0.8.0. See the `DeliveryMethod` doc: this slug is what breaks a consumer
+        // left on the previous tag.
+        assert_eq!(
+            serde_json::to_string(&DeliveryMethod::NovaPoshta).unwrap(),
+            "\"nova_poshta\""
+        );
+    }
+
+    fn dispatched_sample() -> OrderDispatched {
+        OrderDispatched {
+            order_id: "01JABCORDER00000000000000".to_string(),
+            buyer_id: "01JABCBUYER00000000000000".to_string(),
+            seller_id: "01JABCSELLER00000000000000".to_string(),
+            delivery_method: DeliveryMethod::NovaPoshta,
+            tracking_number: Some("20450000000001".to_string()),
+            dispatched_at_ms: 1_780_000_500_000,
+        }
+    }
+
+    #[test]
+    fn order_dispatched_roundtrips() {
+        let ev = dispatched_sample();
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(
+            json.contains("\"delivery_method\":\"nova_poshta\""),
+            "{json}"
+        );
+        assert!(
+            json.contains("\"tracking_number\":\"20450000000001\""),
+            "{json}"
+        );
+        assert!(
+            json.contains("\"dispatched_at_ms\":1780000500000"),
+            "{json}"
+        );
+        let back: OrderDispatched = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ev);
+    }
+
+    /// A seller may dispatch without supplying a TTN, and that dispatch is still published.
+    /// The crate uses no serde attributes, so the absent TTN must reach the wire as an
+    /// explicit `null` rather than being skipped — a consumer distinguishing "never asked"
+    /// from "asked and learned nothing" has to be able to SEE the field.
+    #[test]
+    fn none_tracking_number_serialises_as_explicit_null() {
+        let ev = OrderDispatched {
+            delivery_method: DeliveryMethod::Ukrposhta,
+            tracking_number: None,
+            ..dispatched_sample()
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("\"tracking_number\":null"), "{json}");
+        assert_eq!(serde_json::from_str::<OrderDispatched>(&json).unwrap(), ev);
+    }
+
+    /// # Proof that adding `NovaPoshta` to [`DeliveryMethod`] is WIRE-BREAKING
+    ///
+    /// The claim on the enum's doc is that serde matches variants CLOSED, so a consumer
+    /// still pinned to the previous tag of this crate does not degrade when it receives
+    /// `"nova_poshta"` — it fails to deserialise the whole payload and DLQs the message.
+    /// This crate has been misled before by comments asserting things nothing checked, so
+    /// the claim is executed here rather than written down.
+    ///
+    /// Two versions of one crate cannot be linked into a single test binary, so the
+    /// previous tag is reproduced below as `DeliveryMethodV070` / `OrderCreatedV070`:
+    /// the same derives, the same `rename_all`, the same field names — and, being a copy
+    /// taken before the change, no `NovaPoshta`. That is precisely what a 0.7.0 consumer
+    /// links against, so what the assertions below observe is what it observes.
+    #[test]
+    fn a_consumer_on_the_previous_tag_dlqs_the_new_variant() {
+        /// `DeliveryMethod` exactly as 0.7.0 published it.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum DeliveryMethodV070 {
+            Ukrposhta,
+            SelfPickup,
+            CourierAgreed,
+        }
+
+        /// The subset of `OrderCreated` a 0.7.0 consumer deserialises — enough to show the
+        /// failure is not confined to the enum but takes the entire message with it.
+        #[derive(Debug, Deserialize)]
+        struct OrderCreatedV070 {
+            #[allow(dead_code)]
+            order_id: String,
+            #[allow(dead_code)]
+            delivery_method: DeliveryMethodV070,
+        }
+
+        // The old consumer still handles every slug it knew about. Nothing else broke.
+        for slug in ["ukrposhta", "self_pickup", "courier_agreed"] {
+            assert!(
+                serde_json::from_str::<DeliveryMethodV070>(&format!("\"{slug}\"")).is_ok(),
+                "`{slug}` must still deserialise on the old tag"
+            );
+        }
+
+        // The new slug does not. serde does not fall back to a default or an "unknown"
+        // value; it errors, because variant matching is closed.
+        let err = serde_json::from_str::<DeliveryMethodV070>("\"nova_poshta\"")
+            .expect_err("0.7.0 must NOT be able to deserialise `nova_poshta`");
+        assert!(
+            err.to_string().contains("unknown variant"),
+            "expected an unknown-variant error, got: {err}"
+        );
+
+        // And it takes the whole payload with it — this is the DLQ, not a degraded read.
+        let wire = r#"{
+            "order_id": "01JABCORDER00000000000000",
+            "delivery_method": "nova_poshta"
+        }"#;
+        assert!(
+            serde_json::from_str::<OrderCreatedV070>(wire).is_err(),
+            "a whole OrderCreated payload must fail on the old tag, not just the field"
+        );
+
+        // The same payload is fine on THIS tag. The break is the version skew, nothing else.
+        #[derive(Debug, Deserialize)]
+        struct CurrentOrderCreatedSubset {
+            delivery_method: DeliveryMethod,
+        }
+        let current: CurrentOrderCreatedSubset = serde_json::from_str(wire).unwrap();
+        assert_eq!(current.delivery_method, DeliveryMethod::NovaPoshta);
     }
 }

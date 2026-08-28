@@ -11,9 +11,10 @@
 
 // Exactly the import a producer in `orders-service` writes.
 use beevulyk_queue_contracts::marketplace::orders::{
-    ActorType, ClaimReasonCode, OrderConfirmed, OrderReplacementRequested, OrderStatus,
-    OrderStatusChanged, OrderStockLine, ReplacementClaimLine, TOPIC_ORDER_CONFIRMED,
-    TOPIC_ORDER_CONFIRMED_DLQ, TOPIC_ORDER_REPLACEMENT_REQUESTED,
+    ActorType, ClaimReasonCode, DeliveryMethod, OrderConfirmed, OrderDispatched,
+    OrderReplacementRequested, OrderStatus, OrderStatusChanged, OrderStockLine,
+    ReplacementClaimLine, TOPIC_ORDER_CONFIRMED, TOPIC_ORDER_CONFIRMED_DLQ, TOPIC_ORDER_DISPATCHED,
+    TOPIC_ORDER_DISPATCHED_DLQ, TOPIC_ORDER_REPLACEMENT_REQUESTED,
     TOPIC_ORDER_REPLACEMENT_REQUESTED_DLQ, TOPIC_ORDER_STATUS_CHANGED,
     TOPIC_ORDER_STATUS_CHANGED_DLQ,
 };
@@ -190,7 +191,68 @@ fn every_new_dlq_constant_is_reachable_and_correct() {
             TOPIC_ORDER_REPLACEMENT_REQUESTED,
             TOPIC_ORDER_REPLACEMENT_REQUESTED_DLQ,
         ),
+        (TOPIC_ORDER_DISPATCHED, TOPIC_ORDER_DISPATCHED_DLQ),
     ] {
         assert_eq!(dlq, format!("{topic}.dlq"));
     }
+}
+
+/// The producer side of `OrderDispatched`, added in 0.8.0 — exactly the import and the
+/// construction `orders-service` writes when it relays the event from its outbox.
+#[test]
+fn a_producer_can_build_and_serialise_order_dispatched() {
+    let dispatched = OrderDispatched {
+        order_id: "01JABCORDER00000000000000".to_string(),
+        buyer_id: "01JABCBUYER00000000000000".to_string(),
+        seller_id: "01JABCSELLER00000000000000".to_string(),
+        delivery_method: DeliveryMethod::NovaPoshta,
+        tracking_number: Some("20450000000001".to_string()),
+        dispatched_at_ms: 1_780_000_500_000,
+    };
+
+    assert_eq!(TOPIC_ORDER_DISPATCHED, "marketplace.orders.dispatched");
+
+    let json = serde_json::to_string(&dispatched).unwrap();
+    assert!(
+        json.contains("\"delivery_method\":\"nova_poshta\""),
+        "{json}"
+    );
+}
+
+/// The consumer side: `shipping-service` starts a poll from a raw wire payload, and must be
+/// able to tell a parcel it CAN track from a dispatch that gave it nothing to track.
+///
+/// Both payloads are real dispatches — the second is not a suppressed event and not an
+/// error. Keeping the two distinguishable is why `tracking_number` is `Option<String>`
+/// rather than the event being withheld when a seller supplies no TTN.
+#[test]
+fn the_shipping_consumer_can_tell_a_trackable_dispatch_from_an_untrackable_one() {
+    let with_ttn = r#"{
+        "order_id": "01JABCORDER00000000000000",
+        "buyer_id": "01JABCBUYER00000000000000",
+        "seller_id": "01JABCSELLER00000000000000",
+        "delivery_method": "nova_poshta",
+        "tracking_number": "20450000000001",
+        "dispatched_at_ms": 1780000500000
+    }"#;
+    let ev: OrderDispatched = serde_json::from_str(with_ttn).unwrap();
+    assert_eq!(ev.order_id, "01JABCORDER00000000000000");
+    assert_eq!(ev.delivery_method, DeliveryMethod::NovaPoshta);
+    assert_eq!(ev.tracking_number.as_deref(), Some("20450000000001"));
+    assert_eq!(ev.dispatched_at_ms, 1_780_000_500_000);
+
+    // A seller dispatched without supplying a TTN. The order really shipped; there is just
+    // nothing to poll. The consumer must record this as never-asked, NOT as a poll that
+    // returned no news.
+    let without_ttn = r#"{
+        "order_id": "01JABCORDER00000000000001",
+        "buyer_id": "01JABCBUYER00000000000000",
+        "seller_id": "01JABCSELLER00000000000000",
+        "delivery_method": "ukrposhta",
+        "tracking_number": null,
+        "dispatched_at_ms": 1780000500000
+    }"#;
+    let ev: OrderDispatched = serde_json::from_str(without_ttn).unwrap();
+    assert_eq!(ev.delivery_method, DeliveryMethod::Ukrposhta);
+    assert_eq!(ev.tracking_number, None);
 }

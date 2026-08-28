@@ -5,3 +5,4 @@
 
 pub mod identity;
 pub mod marketplace;
+pub mod shipping;
