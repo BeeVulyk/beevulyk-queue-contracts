@@ -99,10 +99,24 @@ pub enum ShipmentStatus {
 /// before it is published.
 ///
 /// Consumers: `orders-service` (group `orders-service-shipment-status`), which acts on
-/// [`ShipmentStatus::Delivered`] ONLY. `Returned` and `Lost` are carried for observability
-/// and for future consumers — today they move no order and add no state. Publishing them is
-/// deliberate: they are terminal carrier facts, and a topic that only ever said "delivered"
-/// would make a returned parcel indistinguishable from a parcel still in flight.
+/// [`ShipmentStatus::Delivered`] ONLY; and, since 0.9.0, `notification-service` (group
+/// `notification-service-shipment-status`), which tells the BUYER what became of their
+/// parcel. `Returned` and `Lost` are carried for observability and for future consumers —
+/// today they move no order and add no state. Publishing them is deliberate: they are
+/// terminal carrier facts, and a topic that only ever said "delivered" would make a
+/// returned parcel indistinguishable from a parcel still in flight.
+///
+/// # 0.9.0 added `buyer_id`, and that makes this struct FORWARD-INCOMPATIBLE
+///
+/// serde ignores unknown fields, so a consumer pinned to 0.8.0 reads a 0.9.0 payload
+/// without error and needs no bump. The reverse does not hold: a consumer pinned to 0.9.0
+/// CANNOT read a payload produced by a 0.8.0 producer, because `buyer_id` would be absent
+/// and it is not `Option`.
+///
+/// **Deployment order is therefore load-bearing: `shipping-service` (the producer) must be
+/// deployed BEFORE `notification-service` starts consuming.** Proved, not asserted, by
+/// `a_consumer_on_the_previous_tag_cannot_read_a_payload_without_buyer_id` in this module's
+/// tests.
 ///
 /// Publication semantics: see the module doc — transitions only, at-least-once, published
 /// after the shipment row is updated.
@@ -151,6 +165,23 @@ pub struct ShipmentStatusChanged {
     /// message key, and the `order_id` half of the composite `(order_id, fact)` key the
     /// consumer's processed-event ledger MUST be built on.
     pub order_id: String,
+    /// ULID of the buyer — the party notified about the parcel. Added in 0.9.0.
+    ///
+    /// Present because the sole consumer that acts on a human's behalf,
+    /// `notification-service`, holds no gRPC client and can resolve nothing; and
+    /// `orders-service`'s `GetOrder` is party-scoped on caller metadata, so no
+    /// service-to-service lookup exists. `shipping-service` already stores
+    /// `buyer_id NOT NULL` on its own `shipments` row, so this costs the producer no
+    /// lookup.
+    ///
+    /// **Adding this field made 0.9.0 forward-incompatible for this struct** — it is not
+    /// `Option`, so a 0.9.0 consumer fails on a 0.8.0 payload. Deploy `shipping-service`
+    /// BEFORE `notification-service`. See the struct doc.
+    ///
+    /// `seller_id` is deliberately ABSENT: the seller learns the same facts from the
+    /// order's own status changes, and a field nobody reads is an invitation to notify
+    /// both parties from both sources.
+    pub buyer_id: String,
     /// The carrier's tracking number (TTN). NEVER empty: a shipment with no tracking number
     /// is never polled and so produces no event at all. This is not `Option` — the absent
     /// case does not reach this topic.
@@ -176,6 +207,7 @@ mod tests {
     fn sample() -> ShipmentStatusChanged {
         ShipmentStatusChanged {
             order_id: "01JABCORDER00000000000000".to_string(),
+            buyer_id: "01JABCBUYER00000000000000".to_string(),
             tracking_number: "20450000000001".to_string(),
             carrier: Carrier::NovaPoshta,
             status: ShipmentStatus::Delivered,
@@ -192,6 +224,10 @@ mod tests {
         assert!(json.contains("\"status\":\"delivered\""), "{json}");
         assert!(
             json.contains("\"tracking_number\":\"20450000000001\""),
+            "{json}"
+        );
+        assert!(
+            json.contains("\"buyer_id\":\"01JABCBUYER00000000000000\""),
             "{json}"
         );
         let back: ShipmentStatusChanged = serde_json::from_str(&json).unwrap();
@@ -294,5 +330,75 @@ mod tests {
         let back: ShipmentStatusChanged = serde_json::from_str(&json).unwrap();
         assert_ne!(back.occurred_at_ms, back.observed_at_ms);
         assert!(back.observed_at_ms > back.occurred_at_ms);
+    }
+
+    /// # Proof that adding `buyer_id` is FORWARD-INCOMPATIBLE, and BACKWARD-compatible
+    ///
+    /// 0.8.0 broke consumers by adding an enum VARIANT. 0.9.0's break is a different and
+    /// narrower one and the previous lesson does not transfer unchanged, so both directions
+    /// are executed here rather than argued in a comment — this crate has been misled
+    /// before by comments asserting things nothing checked.
+    ///
+    /// Two versions of one crate cannot be linked into a single test binary, so 0.8.0 is
+    /// reproduced below as `ShipmentStatusChangedV080`: the same derives, the same field
+    /// names, the same order — and, being a copy taken before the change, no `buyer_id`.
+    /// That is precisely what a 0.8.0 consumer links against, so what the assertions below
+    /// observe is what it observes. The same technique as
+    /// [`crate::marketplace::orders`]'s `a_consumer_on_the_previous_tag_dlqs_the_new_variant`.
+    ///
+    /// The conclusion is a DEPLOY ORDER: `shipping-service` (producer) before
+    /// `notification-service` (consumer).
+    #[test]
+    fn a_consumer_on_the_previous_tag_cannot_read_a_payload_without_buyer_id() {
+        /// `ShipmentStatusChanged` exactly as 0.8.0 published it.
+        #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+        struct ShipmentStatusChangedV080 {
+            order_id: String,
+            tracking_number: String,
+            carrier: Carrier,
+            status: ShipmentStatus,
+            occurred_at_ms: i64,
+            observed_at_ms: i64,
+        }
+
+        let old_producer_payload = serde_json::to_string(&ShipmentStatusChangedV080 {
+            order_id: "01JABCORDER00000000000000".to_string(),
+            tracking_number: "20450000000001".to_string(),
+            carrier: Carrier::NovaPoshta,
+            status: ShipmentStatus::Delivered,
+            occurred_at_ms: 1_780_000_600_000,
+            observed_at_ms: 1_780_000_900_000,
+        })
+        .unwrap();
+        assert!(
+            !old_producer_payload.contains("buyer_id"),
+            "the 0.8.0 shape must not carry buyer_id, or this test proves nothing"
+        );
+
+        // FORWARD direction — a 0.9.0 consumer reading a 0.8.0 producer. This FAILS, and it
+        // fails on the missing field, taking the whole message to the DLQ.
+        let err = serde_json::from_str::<ShipmentStatusChanged>(&old_producer_payload)
+            .expect_err("0.9.0 must NOT be able to read a payload without `buyer_id`");
+        assert!(
+            err.to_string().contains("missing field `buyer_id`"),
+            "expected a missing-field error naming buyer_id, got: {err}"
+        );
+
+        // BACKWARD direction — a 0.8.0 consumer reading a 0.9.0 producer. This SUCCEEDS:
+        // serde ignores unknown fields, so `orders-service` on 0.8.0 keeps working and
+        // needs no bump. This is why only ONE consumer's pin has to move.
+        let new_producer_payload = serde_json::to_string(&sample()).unwrap();
+        assert!(new_producer_payload.contains("\"buyer_id\""));
+        let old: ShipmentStatusChangedV080 = serde_json::from_str(&new_producer_payload)
+            .expect("0.8.0 must still read a 0.9.0 payload — the extra field is ignored");
+        assert_eq!(old.order_id, sample().order_id);
+        assert_eq!(old.status, ShipmentStatus::Delivered);
+        assert_eq!(old.occurred_at_ms, sample().occurred_at_ms);
+
+        // Taken together: the ONLY safe deployment order is producer first. Between the two
+        // deploys the surviving skew is the harmless one (old payload -> old consumer, new
+        // payload -> old consumer); the broken one (old payload -> new consumer) never
+        // occurs, because by the time notification-service joins at `latest`, every message
+        // being produced already carries the field.
     }
 }

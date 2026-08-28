@@ -22,6 +22,7 @@ use beevulyk_queue_contracts::shipping::shipments::{
 fn a_producer_can_build_and_serialise_the_event() {
     let ev = ShipmentStatusChanged {
         order_id: "01JABCORDER00000000000000".to_string(),
+        buyer_id: "01JABCBUYER00000000000000".to_string(),
         tracking_number: "0501234567890".to_string(),
         carrier: Carrier::Ukrposhta,
         status: ShipmentStatus::Delivered,
@@ -41,6 +42,10 @@ fn a_producer_can_build_and_serialise_the_event() {
     let json = serde_json::to_string(&ev).unwrap();
     assert!(json.contains("\"carrier\":\"ukrposhta\""), "{json}");
     assert!(json.contains("\"status\":\"delivered\""), "{json}");
+    assert!(
+        json.contains("\"buyer_id\":\"01JABCBUYER00000000000000\""),
+        "{json}"
+    );
 }
 
 /// The consumer side: deserialise a raw wire payload of the shape `orders-service` will
@@ -49,6 +54,7 @@ fn a_producer_can_build_and_serialise_the_event() {
 fn the_orders_consumer_can_deserialise_and_read_a_delivered_payload() {
     let wire = r#"{
         "order_id": "01JABCORDER00000000000000",
+        "buyer_id": "01JABCBUYER00000000000000",
         "tracking_number": "20450000000001",
         "carrier": "nova_poshta",
         "status": "delivered",
@@ -82,6 +88,7 @@ fn the_non_actionable_terminal_facts_also_survive_the_wire() {
         let wire = format!(
             r#"{{
                 "order_id": "01JABCORDER00000000000000",
+                "buyer_id": "01JABCBUYER00000000000000",
                 "tracking_number": "20450000000001",
                 "carrier": "nova_poshta",
                 "status": "{slug}",
@@ -105,6 +112,7 @@ fn the_non_actionable_terminal_facts_also_survive_the_wire() {
 fn an_in_transit_heartbeat_is_not_representable_on_this_topic() {
     let heartbeat = r#"{
         "order_id": "01JABCORDER00000000000000",
+        "buyer_id": "01JABCBUYER00000000000000",
         "tracking_number": "20450000000001",
         "carrier": "nova_poshta",
         "status": "in_transit",
@@ -116,5 +124,53 @@ fn an_in_transit_heartbeat_is_not_representable_on_this_topic() {
         serde_json::from_str::<ShipmentStatusChanged>(heartbeat).is_err(),
         "an in-transit heartbeat deserialised — the type-level guarantee that this topic \
          carries only terminal facts has been lost"
+    );
+}
+
+/// `notification-service` becomes a consumer of this topic in 0.9.0, and the ONLY reason it
+/// can address a human is `buyer_id` travelling on the event: it holds no gRPC client and
+/// `orders-service`'s order read is party-scoped on caller metadata, so there is no lookup
+/// to fall back on.
+///
+/// Asserted from OUTSIDE the crate because it is the import `notification-service` writes,
+/// and because the field being readable there is the whole justification for a
+/// forward-incompatible change.
+#[test]
+fn the_notification_consumer_can_address_the_buyer_without_any_lookup() {
+    let wire = r#"{
+        "order_id": "01JABCORDER00000000000000",
+        "buyer_id": "01JABCBUYER00000000000000",
+        "tracking_number": "20450000000001",
+        "carrier": "nova_poshta",
+        "status": "delivered",
+        "occurred_at_ms": 1780000600000,
+        "observed_at_ms": 1780000900000
+    }"#;
+
+    let ev: ShipmentStatusChanged = serde_json::from_str(wire).unwrap();
+    assert_eq!(ev.buyer_id, "01JABCBUYER00000000000000");
+    assert_ne!(ev.buyer_id, ev.order_id);
+}
+
+/// The forward-incompatibility, restated from the consumer's side of the crate boundary: a
+/// 0.8.0 producer's payload does not deserialise here.
+///
+/// This is why the deploy order is `shipping-service` BEFORE `notification-service`.
+#[test]
+fn a_payload_from_a_producer_that_has_not_been_deployed_yet_fails_here() {
+    let pre_deploy = r#"{
+        "order_id": "01JABCORDER00000000000000",
+        "tracking_number": "20450000000001",
+        "carrier": "nova_poshta",
+        "status": "delivered",
+        "occurred_at_ms": 1780000600000,
+        "observed_at_ms": 1780000900000
+    }"#;
+
+    let err = serde_json::from_str::<ShipmentStatusChanged>(pre_deploy)
+        .expect_err("a 0.8.0 payload must not deserialise into the 0.9.0 struct");
+    assert!(
+        err.to_string().contains("missing field `buyer_id`"),
+        "expected a missing-field error naming buyer_id, got: {err}"
     );
 }
