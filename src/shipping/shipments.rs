@@ -100,7 +100,7 @@ pub enum ShipmentStatus {
 ///
 /// Consumers: `orders-service` (group `orders-service-shipment-status`), which acts on
 /// [`ShipmentStatus::Delivered`] ONLY; and, since 0.9.0, `notification-service` (group
-/// `notification-service-shipment-status`), which tells the BUYER what became of their
+/// `notification-service-shipment-status-changed`), which tells the BUYER what became of their
 /// parcel. `Returned` and `Lost` are carried for observability and for future consumers —
 /// today they move no order and add no state. Publishing them is deliberate: they are
 /// terminal carrier facts, and a topic that only ever said "delivered" would make a
